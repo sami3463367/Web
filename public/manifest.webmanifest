@@ -1,0 +1,12 @@
+{
+  "name": "Boighor BD — Premium BD Shop",
+  "short_name": "Boighor BD",
+  "description": "Premium panjabi, leather goods and gadgets. Order via WhatsApp with cash on delivery across Bangladesh.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#faf7f1",
+  "theme_color": "#0b5d3b",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
