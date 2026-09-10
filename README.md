@@ -131,7 +131,7 @@ server/
     ssr.js            [[TOKEN]] template renderer with mtime cache
   lib/                money & totals (single source of truth), product serializers
   routes/             public · auth · orders (WA funnel) · admin
-  data/seed.js        demo catalogue, accounts, 14 days of order history
+  seed.js             demo catalogue, accounts, 14 days of order history
 public/
   index|shop|product|cart|account|admin.html   (SSR tokens + nonce inline bootstrap)
   assets/css/app.css  storefront design system (mobile-first)

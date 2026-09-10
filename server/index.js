@@ -7,7 +7,7 @@
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { seed } from './data/seed.js';
+import { seed } from './seed.js';
 import { all, get, getSettings, seedSettingsIfEmpty } from './core/db.js';
 import { purgeExpiredSessions } from './core/auth.js';
 import { Router } from './core/router.js';

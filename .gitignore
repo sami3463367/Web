@@ -1,5 +1,6 @@
 # runtime data (SQLite DB, WAL files) — never commit customer data
-data/
+# (root-anchored: the seed module lives in server/ and MUST stay tracked)
+/data/
 *.db
 *.db-journal
 *.db-wal

@@ -42,7 +42,7 @@ router.get('/api/admin/stats', (req, res) => {
            SUM(CASE WHEN o.status != 'cancelled' THEN o.total ELSE 0 END) AS revenue,
            COUNT(CASE WHEN o.status != 'cancelled' THEN 1 END) AS orders
     FROM orders o
-    WHERE o.created_at >= datetime('now','-14 days')
+    WHERE o.created_at >= datetime('now','-13 days')
     GROUP BY date(o.created_at)
     ORDER BY day`);
 
