@@ -18,7 +18,6 @@ export default async function (req, res) {
 }
 
 export const config = {
-  runtime: 'nodejs22.x',
   maxDuration: 30
 };
 
