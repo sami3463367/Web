@@ -1,0 +1,27 @@
+{
+  "name": "boighor-bd-commerce",
+  "version": "1.0.0",
+  "description": "Boighor BD — a zero-dependency, mobile-first e-commerce platform for Bangladeshi merchants with a WhatsApp-first checkout funnel and built-in merchant admin panel. No paid services, no npm dependencies.",
+  "type": "module",
+  "main": "server/index.js",
+  "engines": {
+    "node": "^22.5.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server/index.js",
+    "seed": "node --disable-warning=ExperimentalWarning server/seed.js --force",
+    "test": "node --disable-warning=ExperimentalWarning --test"
+  },
+  "keywords": [
+    "ecommerce",
+    "bangladesh",
+    "bdt",
+    "whatsapp-commerce",
+    "zero-dependency",
+    "mobile-first"
+  ],
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}
