@@ -2,20 +2,19 @@
  * Boighor BD — application entry
  * Zero-dependency Node HTTP server: SSR pages + JSON API + static assets.
  *
- *   PORT=3000 npm start
+ *   local / VPS / preview : node server/index.js        (embedded SQLite)
+ *   Vercel                : api/index.js re-exports `handler` (Turso/libsql)
  */
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { seed } from './seed.js';
-import { all, get, getSettings, seedSettingsIfEmpty } from './core/db.js';
+import { seed, ensureSeeded } from './seed.js';
+import { all, get, getSettings, seedSettingsIfEmpty, ensureSchema, DRIVER } from './core/db.js';
 import { purgeExpiredSessions } from './core/auth.js';
 import { Router } from './core/router.js';
 import { json, html, HttpError, serveStatic, redirect } from './core/http.js';
 import { render } from './core/ssr.js';
 import { productCardHTML, esc, bdt, primaryImage, stars } from '../public/assets/js/tpl.js';
-
-const starsHtml = (rating) => `<span aria-hidden="true">${stars(rating)}</span>`;
 import { toPublic, PRODUCT_COLUMNS, PRODUCT_JOIN } from './lib/products.js';
 import publicRouter from './routes/public.js';
 import authRouter from './routes/auth.routes.js';
@@ -25,9 +24,30 @@ import adminRouter from './routes/admin.routes.js';
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 
+const starsHtml = (rating) => `<span aria-hidden="true">${stars(rating)}</span>`;
+
 /* ------------------------------ boot ------------------------------ */
-seedSettingsIfEmpty();
-seed();
+let booted = false;
+export async function boot() {
+  if (booted) return;
+  booted = true;
+  await ensureSchema();
+  await seedSettingsIfEmpty();
+  if (DRIVER === 'sqlite') await seed();
+  // on libsql the dataset is created lazily on first request (ensureReady)
+}
+
+/** Called at the top of every request; cheap after first run. */
+let readyPromise = null;
+export function ensureReady() {
+  if (!readyPromise) {
+    readyPromise = (async () => {
+      await boot();
+      if (DRIVER !== 'sqlite') await ensureSeeded();
+    })();
+  }
+  return readyPromise;
+}
 
 const api = new Router();
 for (const r of [publicRouter, authRouter, ordersRouter, adminRouter]) {
@@ -58,31 +78,6 @@ function securityHeaders(res, nonce) {
 }
 
 /* ------------------------------ SSR helpers ----------------------------- */
-function homeTokens() {
-  const s = getSettings();
-  const categories = all('SELECT slug, name, icon FROM categories ORDER BY sort, name');
-  const featured = all(
-    `SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN} WHERE p.status='active' AND p.featured=1 ORDER BY p.sold DESC LIMIT 8`
-  ).map(toPublic);
-  const newest = all(
-    `SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN} WHERE p.status='active' ORDER BY p.created_at DESC, p.id DESC LIMIT 8`
-  ).map(toPublic);
-  return {
-    tokens: {
-      SHOP_NAME: esc(s.shop_name),
-      TAGLINE: esc(s.shop_tagline),
-      ANNOUNCEMENT: esc(s.announcement),
-      CATEGORY_CHIPS: categories
-        .map((c) => `<button class="chip" data-category="${esc(c.slug)}">${esc(c.icon)} ${esc(c.name)}</button>`)
-        .join(''),
-      FEATURED_GRID: featured.map(productCardHTML).join('\n'),
-      NEW_GRID: newest.map(productCardHTML).join('\n'),
-      INITIAL_JSON: JSON.stringify({ settings: publicSettings(s), categories, featured, newest }).replace(/</g, '\\u003c')
-    },
-    featured
-  };
-}
-
 function publicSettings(s) {
   return {
     shop_name: s.shop_name,
@@ -94,6 +89,28 @@ function publicSettings(s) {
   };
 }
 
+async function homeTokens() {
+  const s = getSettings();
+  const categories = await all('SELECT slug, name, icon FROM categories ORDER BY sort, name');
+  const featured = (await all(
+    `SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN} WHERE p.status='active' AND p.featured=1 ORDER BY p.sold DESC LIMIT 8`
+  )).map(toPublic);
+  const newest = (await all(
+    `SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN} WHERE p.status='active' ORDER BY p.created_at DESC, p.id DESC LIMIT 8`
+  )).map(toPublic);
+  return {
+    SHOP_NAME: esc(s.shop_name),
+    TAGLINE: esc(s.shop_tagline),
+    ANNOUNCEMENT: esc(s.announcement),
+    CATEGORY_CHIPS: categories
+      .map((c) => `<button class="chip" data-category="${esc(c.slug)}">${esc(c.icon)} ${esc(c.name)}</button>`)
+      .join(''),
+    FEATURED_GRID: featured.map(productCardHTML).join('\n'),
+    NEW_GRID: newest.map(productCardHTML).join('\n'),
+    INITIAL_JSON: JSON.stringify({ settings: publicSettings(s), categories, featured, newest }).replace(/</g, '\\u003c')
+  };
+}
+
 function servePage(res, name, tokens = {}, status = 200) {
   html(res, status, render(name, { NONCE: res.nonce, ...tokens }));
 }
@@ -101,14 +118,13 @@ function servePage(res, name, tokens = {}, status = 200) {
 /* -------------------------------- pages -------------------------------- */
 const pages = new Router();
 
-pages.get('/', (req, res) => {
-  const { tokens } = homeTokens();
-  servePage(res, 'index.html', tokens);
+pages.get('/', async (req, res) => {
+  servePage(res, 'index.html', await homeTokens());
 });
 
-pages.get('/shop', (req, res) => {
+pages.get('/shop', async (req, res) => {
   const s = getSettings();
-  const categories = all('SELECT slug, name, icon FROM categories ORDER BY sort, name');
+  const categories = await all('SELECT slug, name, icon FROM categories ORDER BY sort, name');
   servePage(res, 'shop.html', {
     SHOP_NAME: esc(s.shop_name),
     ANNOUNCEMENT: esc(s.announcement),
@@ -116,14 +132,14 @@ pages.get('/shop', (req, res) => {
   });
 });
 
-pages.get('/product/:slug', (req, res) => {
-  const row = get(`SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN} WHERE p.slug = ? AND p.status = 'active'`, req.params.slug);
+pages.get('/product/:slug', async (req, res) => {
+  const row = await get(`SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN} WHERE p.slug = ? AND p.status = 'active'`, req.params.slug);
   if (!row) throw new HttpError(404, 'Product not found');
   const p = toPublic(row);
-  const related = all(
+  const related = (await all(
     `SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN} WHERE p.category_id = ? AND p.id != ? AND p.status='active' ORDER BY p.sold DESC LIMIT 4`,
     row.category_id, row.id
-  ).map(toPublic);
+  )).map(toPublic);
   const s = getSettings();
   const img = primaryImage(p);
   const jsonLd = {
@@ -180,19 +196,17 @@ pages.get('/product/:slug', (req, res) => {
 });
 
 for (const [route, file] of [['/cart', 'cart.html'], ['/account', 'account.html'], ['/admin', 'admin.html']]) {
-  pages.get(route, (req, res) => {
+  pages.get(route, async (req, res) => {
     const s = getSettings();
     servePage(res, file, { SHOP_NAME: esc(s.shop_name), ANNOUNCEMENT: esc(s.announcement) });
   });
 }
 
-pages.get('/sitemap.xml', (req, res) => {
-  const products = all(`SELECT slug, updated_at FROM products WHERE status='active'`);
-  const base = `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host || 'localhost'}`;
-  const urls = [
-    '/', '/shop', '/cart', '/account',
-    ...products.map((p) => `/product/${p.slug}`)
-  ];
+pages.get('/sitemap.xml', async (req, res) => {
+  const products = await all(`SELECT slug, updated_at FROM products WHERE status='active'`);
+  const proto = req.headers['x-forwarded-proto'] || 'http';
+  const base = `${proto}://${req.headers.host || 'localhost'}`;
+  const urls = ['/', '/shop', '/cart', '/account', ...products.map((p) => `/product/${p.slug}`)];
   const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n` +
     urls.map((u) => `  <url><loc>${base}${u}</loc></url>`).join('\n') +
     `\n</urlset>`;
@@ -207,11 +221,11 @@ pages.get('/robots.txt', (req, res) => {
 });
 
 /* ------------------------------ dispatcher ------------------------------ */
-const server = http.createServer(async (req, res) => {
+export async function handler(req, res) {
   const started = Date.now();
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   req.url = url;
-  req.ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '0.0.0.0';
+  req.ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || '0.0.0.0';
   res.reqHeaders = req.headers;
   res.json = (status, data, headers) => json(res, status, data, headers);
   res.nonce = crypto.randomBytes(12).toString('base64url');
@@ -220,6 +234,7 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Server', 'boighor-bd');
 
   try {
+    await ensureReady();
     if (url.pathname.startsWith('/api/')) {
       const handled = await api.handle(req, res, url);
       if (!handled) throw new HttpError(404, 'Not found');
@@ -245,29 +260,30 @@ const server = http.createServer(async (req, res) => {
   } finally {
     if (!res.writableEnded) res.end();
     const ms = Date.now() - started;
-    if (ms > 250 || status4xx(res)) console.log(`${req.method} ${url.pathname} ${res.statusCode} ${ms}ms`);
+    if (ms > 400 || res.statusCode >= 400) console.log(`${req.method} ${url.pathname} ${res.statusCode} ${ms}ms`);
   }
-});
+}
 
-function status4xx(res) { return res.statusCode >= 400; }
-
-server.listen(PORT, HOST, () => {
-  console.log(`
+/* ------------------------- standalone process mode ------------------------- */
+import { fileURLToPath } from 'node:url';
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  const server = http.createServer(handler);
+  server.listen(PORT, HOST, () => {
+    console.log(`
   ┌──────────────────────────────────────────────────────┐
   │  🛍️  Boighor BD commerce is running                    │
   │  Storefront  http://localhost:${String(PORT).padEnd(5)}                   │
   │  Admin panel http://localhost:${String(PORT).padEnd(5)}/admin             │
   │      admin login → 01700000000 / admin123              │
-  │  Dependencies: none · DB: SQLite (data/shop.db)       │
+  │  DB driver: ${DRIVER === 'sqlite' ? 'embedded SQLite (node:sqlite)   ' : 'Turso / libsql (remote)            '} │
   └──────────────────────────────────────────────────────┘`);
-});
-
-/* housekeeping */
-setInterval(() => { try { purgeExpiredSessionsDb(); } catch {} }, 60 * 60 * 1000).unref();
-
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 1500).unref();
   });
+  setInterval(() => { purgeExpiredSessions().catch(() => {}); }, 60 * 60 * 1000).unref();
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 1500).unref();
+    });
+  }
 }

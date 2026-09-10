@@ -1,20 +1,24 @@
 /**
- * Boighor BD — Seed data
+ * Boighor BD — Seed data (async, dual driver)
  * Demo catalogue for a Bangladeshi shop (BDT), a merchant admin account,
  * and ~14 days of order history so the analytics dashboard is meaningful.
  *
- *   npm run seed              # seed only when the DB is empty
- *   npm run seed -- --force   # wipe & re-seed
+ * Statements use explicit ids so the whole dataset can be written as atomic
+ * batches — identical behaviour on embedded SQLite and on Turso/libsql.
+ *
+ *   npm run seed                # seed local DB when empty
+ *   npm run seed -- --force     # wipe & re-seed local DB
+ *   TURSO_URL=… TURSO_AUTH_TOKEN=… npm run seed -- --force   # seed remote DB
  */
-import { db, get, run, tx, seedSettingsIfEmpty } from './core/db.js';
+import { get, run, batch, seedSettingsIfEmpty, DRIVER, ensureSchema } from './core/db.js';
 import { hashPassword } from './core/auth.js';
 import { computeTotals } from './lib/money.js';
 
 const CATEGORIES = [
-  { slug: 'men', name: "Men's Wear", icon: '👔', sort: 1 },
-  { slug: 'women', name: "Women's Wear", icon: '🥻', sort: 2 },
-  { slug: 'leather', name: 'Leather Goods', icon: '👜', sort: 3 },
-  { slug: 'gadgets', name: 'Gadgets', icon: '🎧', sort: 4 }
+  { id: 1, slug: 'men', name: "Men's Wear", icon: '👔', sort: 1 },
+  { id: 2, slug: 'women', name: "Women's Wear", icon: '🥻', sort: 2 },
+  { id: 3, slug: 'leather', name: 'Leather Goods', icon: '👜', sort: 3 },
+  { id: 4, slug: 'gadgets', name: 'Gadgets', icon: '🎧', sort: 4 }
 ];
 
 const img = (key) => [
@@ -23,7 +27,7 @@ const img = (key) => [
 
 const PRODUCTS = [
   {
-    slug: 'premium-cotton-panjabi', category: 'men',
+    id: 1, slug: 'premium-cotton-panjabi', category: 1,
     name: 'Premium Cotton Panjabi — Eid Collection',
     summary: 'Breathable combed cotton with hand-finished gold zari embroidery.',
     description:
@@ -34,7 +38,7 @@ const PRODUCTS = [
     stock: 24, rating: 4.8, rating_count: 214, sold: 412, featured: 1
   },
   {
-    slug: 'genuine-leather-oxford-shoes', category: 'men',
+    id: 2, slug: 'genuine-leather-oxford-shoes', category: 1,
     name: 'Genuine Leather Oxford Shoes',
     summary: 'Full-grain Bangladeshi leather, hand-stitched, office ready.',
     description:
@@ -45,7 +49,7 @@ const PRODUCTS = [
     stock: 12, rating: 4.6, rating_count: 96, sold: 168, featured: 1
   },
   {
-    slug: 'jamdani-half-silk-saree', category: 'women',
+    id: 3, slug: 'jamdani-half-silk-saree', category: 2,
     name: 'Jamdani Half-Silk Saree (Rupganj)',
     summary: 'Handwoven Rupganj jamdani with intricate floral motifs.',
     description:
@@ -56,7 +60,7 @@ const PRODUCTS = [
     stock: 7, rating: 4.9, rating_count: 58, sold: 74, featured: 1
   },
   {
-    slug: 'cotton-three-piece-kurti-set', category: 'women',
+    id: 4, slug: 'cotton-three-piece-kurti-set', category: 2,
     name: 'Cotton 3-Piece Kurti Set (Block Print)',
     summary: 'Soft cotton kurti, salwar & dupatta in hand block prints.',
     description:
@@ -67,7 +71,7 @@ const PRODUCTS = [
     stock: 18, rating: 4.7, rating_count: 132, sold: 240, featured: 1
   },
   {
-    slug: 'handcrafted-leather-wallet', category: 'leather',
+    id: 5, slug: 'handcrafted-leather-wallet', category: 3,
     name: 'Handcrafted Genuine Leather Wallet',
     summary: 'Bifold wallet, 8 card slots, RFID-safe lining.',
     description:
@@ -78,7 +82,7 @@ const PRODUCTS = [
     stock: 30, rating: 4.8, rating_count: 301, sold: 520, featured: 1
   },
   {
-    slug: 'leather-crossbody-bag', category: 'leather',
+    id: 6, slug: 'leather-crossbody-bag', category: 3,
     name: 'Leather Crossbody Bag — Mustard',
     summary: 'Structured crossbody in pebbled leather with gold hardware.',
     description:
@@ -89,7 +93,7 @@ const PRODUCTS = [
     stock: 0, rating: 4.5, rating_count: 44, sold: 61, featured: 0
   },
   {
-    slug: 'tws-bluetooth-earbuds-pro', category: 'gadgets',
+    id: 7, slug: 'tws-bluetooth-earbuds-pro', category: 4,
     name: 'TWS Bluetooth Earbuds Pro (ENC)',
     summary: '40h playtime, ENC calls, Type-C fast charge, IPX5.',
     description:
@@ -100,7 +104,7 @@ const PRODUCTS = [
     stock: 40, rating: 4.4, rating_count: 187, sold: 356, featured: 1
   },
   {
-    slug: 'powerbank-20000mah-fast-charge', category: 'gadgets',
+    id: 8, slug: 'powerbank-20000mah-fast-charge', category: 4,
     name: '20000mAh Power Bank (22.5W Fast Charge)',
     summary: 'Charges 3 devices at once, LED % display, airline safe.',
     description:
@@ -138,113 +142,119 @@ function orderCode(date, seq) {
   return `BD-${yy}${mm}${dd}-${String(seq).padStart(4, '0')}`;
 }
 
-export function seed({ force = false } = {}) {
-  const existing = get('SELECT COUNT(*) AS c FROM products').c;
+const CHUNK = 120;
+async function flush(stmts) {
+  for (let i = 0; i < stmts.length; i += CHUNK) {
+    await batch(stmts.slice(i, i + CHUNK));
+  }
+  stmts.length = 0;
+}
+
+export async function seed({ force = false } = {}) {
+  const existing = (await get('SELECT COUNT(*) AS c FROM products'))?.c || 0;
   if (existing > 0 && !force) return false;
 
-  tx(() => {
-    if (force) {
-      db.exec(`DELETE FROM order_items; DELETE FROM orders; DELETE FROM products;
-               DELETE FROM categories; DELETE FROM users; DELETE FROM sessions; DELETE FROM settings;`);
-      db.exec(`DELETE FROM sqlite_sequence WHERE name IN ('order_items','orders','products','categories','users');`);
+  if (force) {
+    for (const t of ['order_items', 'orders', 'products', 'categories', 'users', 'sessions', 'settings']) {
+      await run(`DELETE FROM ${t}`);
     }
-    seedSettingsIfEmpty();
+  }
+  await seedSettingsIfEmpty();
 
-    for (const c of CATEGORIES) {
-      run('INSERT INTO categories(slug,name,icon,sort) VALUES(?,?,?,?)', c.slug, c.name, c.icon, c.sort);
-    }
-    const catId = {};
-    for (const c of CATEGORIES) catId[c.slug] = get('SELECT id FROM categories WHERE slug=?', c.slug).id;
-
-    for (const p of PRODUCTS) {
-      run(
-        `INSERT INTO products(slug,category_id,name,summary,description,price,compare_price,images,sizes,colors,stock,low_stock_at,rating,rating_count,sold,featured,status)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active')`,
-        p.slug, catId[p.category], p.name, p.summary, p.description, p.price, p.compare_price,
+  const stmts = [];
+  for (const c of CATEGORIES) {
+    stmts.push({ sql: 'INSERT INTO categories(id,slug,name,icon,sort) VALUES(?,?,?,?,?)', params: [c.id, c.slug, c.name, c.icon, c.sort] });
+  }
+  for (const p of PRODUCTS) {
+    stmts.push({
+      sql: `INSERT INTO products(id,slug,category_id,name,summary,description,price,compare_price,images,sizes,colors,stock,low_stock_at,rating,rating_count,sold,featured,status)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,5,?,?,?,?, 'active')`,
+      params: [p.id, p.slug, p.category, p.name, p.summary, p.description, p.price, p.compare_price,
         JSON.stringify(p.images), JSON.stringify(p.sizes), JSON.stringify(p.colors),
-        p.stock, 5, p.rating, p.rating_count, p.sold, p.featured
-      );
-    }
-
-    /* accounts */
-    run(
-      `INSERT INTO users(name,phone,email,password_hash,address,role) VALUES(?,?,?,?,?, 'admin')`,
-      'Merchant Admin', '01700000000', 'admin@boighor.bd', hashPassword('admin123'),
-      'Shop 42, Level 3, Bashundhara City, Dhaka'
-    );
-    run(
-      `INSERT INTO users(name,phone,email,password_hash,address,role) VALUES(?,?,?,?,?, 'customer')`,
-      'Demo Customer', '01712345678', 'demo@boighor.bd', hashPassword('demo123'),
-      'House 7, Road 11, Banani, Dhaka'
-    );
-
-    /* ~14 days of order history for the analytics dashboard */
-    const products = db.prepare('SELECT id, name, price, sizes, colors FROM products').all();
-    let seq = 0;
-    for (let daysAgo = 14; daysAgo >= 0; daysAgo--) {
-      const ordersToday = daysAgo === 0 ? between(1, 2) : between(1, 4);
-      for (let i = 0; i < ordersToday; i++) {
-        seq += 1;
-        const lineCount = between(1, 3);
-        const lines = [];
-        const chosen = new Set();
-        for (let l = 0; l < lineCount; l++) {
-          const p = pick(products);
-          if (chosen.has(p.id)) continue;
-          chosen.add(p.id);
-          const sizes = JSON.parse(p.sizes || '[]');
-          const colors = JSON.parse(p.colors || '[]');
-          const variant = [sizes.length ? pick(sizes) : '', colors.length ? pick(colors).name : ''].filter(Boolean).join(' / ');
-          lines.push({ product: p, variant, qty: between(1, 2), unitPrice: p.price });
-        }
-        if (!lines.length) continue;
-        const zone = rnd() < 0.62 ? 'dhaka' : 'outside';
-        const totals = computeTotals(
-          lines.map((l) => ({ unitPrice: l.unitPrice, qty: l.qty })), zone
-        );
-        /* stamp each order inside its own UTC day so the 14-day chart
-           always has contiguous history, regardless of when seeding runs */
-        const nowD = new Date();
-        let date;
-        if (daysAgo === 0) {
-          const midnight = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate());
-          const maxJitterMin = Math.min(300, Math.floor((Date.now() - midnight) / 60000));
-          date = new Date(Date.now() - between(0, Math.max(0, maxJitterMin)) * 60000);
-        } else {
-          date = new Date(Date.UTC(
-            nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate() - daysAgo,
-            10 + between(0, 8), between(0, 59)
-          ));
-        }
-        const iso = date.toISOString().replace('T', ' ').slice(0, 19);
-        const status = daysAgo === 0 ? 'pending'
-          : daysAgo <= 2 ? pick(['pending', 'confirmed', 'confirmed'])
-          : daysAgo <= 6 ? pick(['confirmed', 'shipped', 'shipped'])
-          : pick(['delivered', 'delivered', 'delivered', 'cancelled']);
-        const name = pick(BD_NAMES);
-        const phone = `01${pick(['7', '8', '9'])}${String(between(10000000, 99999999))}`;
-        const res = run(
-          `INSERT INTO orders(code,user_id,customer_name,customer_phone,customer_address,zone,subtotal,delivery_fee,discount,total,status,channel,created_at,updated_at)
-           VALUES(?,NULL,?,?,?,?,?,?,?,?,?, 'whatsapp', ?, ?)`,
-          orderCode(date, seq), name, phone, pick(BD_AREAS), zone,
-          totals.subtotal, totals.delivery_fee, 0, totals.total, status, iso, iso
-        );
-        const orderId = Number(res.lastInsertRowid);
-        for (const l of lines) {
-          run(
-            'INSERT INTO order_items(order_id,product_id,product_name,variant,qty,unit_price) VALUES(?,?,?,?,?,?)',
-            orderId, l.product.id, l.product.name, l.variant, l.qty, l.unitPrice
-          );
-        }
-      }
-    }
+        p.stock, p.rating, p.rating_count, p.sold, p.featured]
+    });
+  }
+  stmts.push({
+    sql: `INSERT INTO users(id,name,phone,email,password_hash,address,role) VALUES(?,?,?,?,?,?, 'admin')`,
+    params: [1, 'Merchant Admin', '01700000000', 'admin@boighor.bd', hashPassword('admin123'), 'Shop 42, Level 3, Bashundhara City, Dhaka']
   });
+  stmts.push({
+    sql: `INSERT INTO users(id,name,phone,email,password_hash,address,role) VALUES(?,?,?,?,?,?, 'customer')`,
+    params: [2, 'Demo Customer', '01712345678', 'demo@boighor.bd', hashPassword('demo123'), 'House 7, Road 11, Banani, Dhaka']
+  });
+  await flush(stmts);
+
+  /* ~14 days of order history for the analytics dashboard */
+  let seq = 0;
+  let orderId = 0;
+  for (let daysAgo = 14; daysAgo >= 0; daysAgo--) {
+    const ordersToday = daysAgo === 0 ? between(1, 2) : between(1, 4);
+    for (let i = 0; i < ordersToday; i++) {
+      seq += 1;
+      orderId += 1;
+      const lineCount = between(1, 3);
+      const lines = [];
+      const chosen = new Set();
+      for (let l = 0; l < lineCount; l++) {
+        const p = pick(PRODUCTS);
+        if (chosen.has(p.id)) continue;
+        chosen.add(p.id);
+        const variant = [p.sizes.length ? pick(p.sizes) : '', p.colors.length ? pick(p.colors).name : ''].filter(Boolean).join(' / ');
+        lines.push({ product: p, variant, qty: between(1, 2), unitPrice: p.price });
+      }
+      if (!lines.length) { orderId -= 1; continue; }
+      const zone = rnd() < 0.62 ? 'dhaka' : 'outside';
+      const totals = computeTotals(lines.map((l) => ({ unitPrice: l.unitPrice, qty: l.qty })), zone);
+
+      /* stamp each order inside its own UTC day so the 14-day chart always
+         has contiguous history, regardless of when seeding runs */
+      const nowD = new Date();
+      let date;
+      if (daysAgo === 0) {
+        const midnight = Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate());
+        const maxJitterMin = Math.min(300, Math.floor((Date.now() - midnight) / 60000));
+        date = new Date(Date.now() - between(0, Math.max(0, maxJitterMin)) * 60000);
+      } else {
+        date = new Date(Date.UTC(nowD.getUTCFullYear(), nowD.getUTCMonth(), nowD.getUTCDate() - daysAgo, 10 + between(0, 8), between(0, 59)));
+      }
+      const iso = date.toISOString().replace('T', ' ').slice(0, 19);
+      const status = daysAgo === 0 ? 'pending'
+        : daysAgo <= 2 ? pick(['pending', 'confirmed', 'confirmed'])
+        : daysAgo <= 6 ? pick(['confirmed', 'shipped', 'shipped'])
+        : pick(['delivered', 'delivered', 'delivered', 'cancelled']);
+      const name = pick(BD_NAMES);
+      const phone = `01${pick(['7', '8', '9'])}${String(between(10000000, 99999999))}`;
+
+      stmts.push({
+        sql: `INSERT INTO orders(id,code,user_id,customer_name,customer_phone,customer_address,zone,subtotal,delivery_fee,discount,total,status,channel,created_at,updated_at)
+              VALUES(?,?,NULL,?,?,?,?,?,?,?,?,?, 'whatsapp', ?, ?)`,
+        params: [orderId, orderCode(date, seq), name, phone, pick(BD_AREAS), zone,
+          totals.subtotal, totals.delivery_fee, 0, totals.total, status, iso, iso]
+      });
+      for (const l of lines) {
+        stmts.push({
+          sql: 'INSERT INTO order_items(order_id,product_id,product_name,variant,qty,unit_price) VALUES(?,?,?,?,?,?)',
+          params: [orderId, l.product.id, l.product.name, l.variant, l.qty, l.unitPrice]
+        });
+      }
+      if (stmts.length > CHUNK) await flush(stmts);
+    }
+  }
+  await flush(stmts);
   return true;
+}
+
+/** Serverless first-boot: make sure schema + data exist (idempotent). */
+export async function ensureSeeded() {
+  await ensureSchema();
+  await seedSettingsIfEmpty();
+  const count = (await get('SELECT COUNT(*) AS c FROM products'))?.c || 0;
+  if (count === 0) await seed();
 }
 
 /* CLI entry */
 if (process.argv[1] && process.argv[1].endsWith('seed.js')) {
-  const did = seed({ force: process.argv.includes('--force') });
-  console.log(did ? '✅ Database seeded.' : 'ℹ️  Database already has products — skipping (use --force to re-seed).');
+  const did = await seed({ force: process.argv.includes('--force') });
+  console.log(did ? `✅ Database seeded (${DRIVER}).` : `ℹ️  Database already has products — skipping (use --force to re-seed). [${DRIVER}]`);
   process.exit(0);
 }

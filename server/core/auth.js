@@ -1,10 +1,10 @@
 /**
  * Boighor BD — Authentication (zero dependencies)
  * scrypt password hashing (Node native), opaque session tokens stored
- * as SHA-256 hashes, httpOnly SameSite=Lax cookies.
+ * as SHA-256 hashes, httpOnly SameSite=Lax cookies. Async (dual DB driver).
  */
 import crypto from 'node:crypto';
-import { get, run, all } from './db.js';
+import { get, run } from './db.js';
 import { parseCookies, setCookie, HttpError } from './http.js';
 
 const SCRYPT_OPTS = { N: 16384, r: 8, p: 1 };
@@ -30,47 +30,45 @@ export function verifyPassword(password, stored) {
 }
 
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const nowStamp = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-export function createSession(res, userId) {
+export async function createSession(res, userId) {
   const token = crypto.randomBytes(24).toString('base64url');
   const expires = new Date(Date.now() + SESSION_DAYS * 864e5).toISOString().replace('T', ' ').slice(0, 19);
-  run('INSERT INTO sessions(token_hash, user_id, expires_at) VALUES (?,?,?)', sha256(token), userId, expires);
+  await run('INSERT INTO sessions(token_hash, user_id, expires_at) VALUES (?,?,?)', sha256(token), userId, expires);
   setCookie(res, SESSION_COOKIE, token, { maxAge: SESSION_DAYS * 86400 });
   return token;
 }
 
-export function destroySession(req, res) {
+export async function destroySession(req, res) {
   const token = parseCookies(req)[SESSION_COOKIE];
-  if (token) run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
+  if (token) await run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
   setCookie(res, SESSION_COOKIE, '', { maxAge: 0 });
 }
 
 const PUBLIC_USER_SQL = `SELECT id, name, phone, email, address, role, created_at FROM users WHERE id = ?`;
 
-/** Returns the signed-in user row or null. Also lazily purges expired sessions. */
-export function currentUser(req) {
+/** Returns the signed-in user row or null. */
+export async function currentUser(req) {
   const token = parseCookies(req)[SESSION_COOKIE];
   if (!token) return null;
-  const session = get(
-    `SELECT s.user_id, s.expires_at FROM sessions s WHERE s.token_hash = ?`,
-    sha256(token)
-  );
+  const session = await get('SELECT s.user_id, s.expires_at FROM sessions s WHERE s.token_hash = ?', sha256(token));
   if (!session) return null;
-  if (session.expires_at < new Date().toISOString().replace('T', ' ').slice(0, 19)) {
-    run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
+  if (session.expires_at < nowStamp()) {
+    await run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
     return null;
   }
-  return get(PUBLIC_USER_SQL, session.user_id) || null;
+  return (await get(PUBLIC_USER_SQL, session.user_id)) || null;
 }
 
-export function requireUser(req) {
-  const user = currentUser(req);
+export async function requireUser(req) {
+  const user = await currentUser(req);
   if (!user) throw new HttpError(401, 'Please sign in to continue');
   return user;
 }
 
-export function requireAdmin(req) {
-  const user = currentUser(req);
+export async function requireAdmin(req) {
+  const user = await currentUser(req);
   if (!user) throw new HttpError(401, 'Admin sign-in required');
   if (user.role !== 'admin') throw new HttpError(403, 'Admin access only');
   return user;
@@ -89,13 +87,11 @@ export function throttle(key, max = 12, windowMs = 10 * 60 * 1000) {
   if (rec.count > max) throw new HttpError(429, 'Too many attempts — please wait a few minutes');
 }
 
-export function purgeExpiredSessions() {
-  run(`DELETE FROM sessions WHERE expires_at < datetime('now')`);
+export async function purgeExpiredSessions() {
+  await run(`DELETE FROM sessions WHERE expires_at < datetime('now')`);
 }
 
 export function publicUser(u) {
   if (!u) return null;
   return { id: u.id, name: u.name, phone: u.phone, email: u.email, address: u.address, role: u.role, created_at: u.created_at };
 }
-
-export { all };

@@ -25,8 +25,8 @@ router.get('/api/settings', (req, res) => {
   });
 });
 
-router.get('/api/categories', (req, res) => {
-  const rows = all(
+router.get('/api/categories', async (req, res) => {
+  const rows = await all(
     `SELECT c.id, c.slug, c.name, c.icon, c.sort,
             (SELECT COUNT(*) FROM products p WHERE p.category_id = c.id AND p.status='active') AS product_count
      FROM categories c ORDER BY c.sort, c.name`
@@ -42,7 +42,7 @@ const SORTS = {
   rating: 'p.rating DESC'
 };
 
-router.get('/api/products', (req, res) => {
+router.get('/api/products', async (req, res) => {
   const q = req.url.searchParams;
   const where = [`p.status = 'active'`];
   const params = [];
@@ -61,8 +61,8 @@ router.get('/api/products', (req, res) => {
   const page = Math.max(1, parseInt(q.get('page') || '1', 10) || 1);
   const per = Math.min(48, Math.max(1, parseInt(q.get('per') || '24', 10) || 24));
 
-  const total = get(`SELECT COUNT(*) AS c ${PRODUCT_JOIN} WHERE ${where.join(' AND ')}`, ...params).c;
-  const rows = all(
+  const total = (await get(`SELECT COUNT(*) AS c ${PRODUCT_JOIN} WHERE ${where.join(' AND ')}`, ...params)).c;
+  const rows = await all(
     `SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN}
      WHERE ${where.join(' AND ')}
      ORDER BY ${sort}
@@ -77,13 +77,13 @@ router.get('/api/products', (req, res) => {
   });
 });
 
-router.get('/api/products/:slug', (req, res) => {
-  const row = get(
+router.get('/api/products/:slug', async (req, res) => {
+  const row = await get(
     `SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN} WHERE p.slug = ?`,
     req.params.slug
   );
   if (!row || row.status !== 'active') throw new HttpError(404, 'Product not found');
-  const related = all(
+  const related = await all(
     `SELECT ${PRODUCT_COLUMNS} ${PRODUCT_JOIN}
      WHERE p.category_id = ? AND p.id != ? AND p.status='active'
      ORDER BY p.sold DESC LIMIT 4`,

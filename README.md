@@ -152,17 +152,45 @@ Design decisions worth knowing:
 
 ---
 
-## Deploying (free tiers)
+## Deploying for free (no credit card) — Vercel + Turso
 
-The app is a single Node process that writes one SQLite file:
+The app is **dual-driver**: embedded SQLite for local/VPS/preview, and **Turso
+(libsql) over HTTP** automatically when `TURSO_URL` + `TURSO_AUTH_TOKEN` are set.
+`vercel.json` is already configured: static assets (CSS/JS/WebP) are served by
+Vercel's CDN from `public/`, and every dynamic route (SSR pages + API + admin)
+runs in one Node 22 serverless function (`api/index.js`).
 
-- **Render / Railway / Fly.io free tiers:** build `none`, start `npm start`,
-  set `PORT` (injected automatically). Persistent-disk/volume for `data/` if offered.
-- **Any VPS:** `npm start` behind nginx/Caddy with TLS.
-- Configuration is env-only: `PORT`, `HOST`, `DATA_DIR` (see `.env.example`).
+**1 · Turso (free tier, sign up with GitHub — no card)**
+```bash
+# either the dashboard (turso.com → Create database) or the CLI:
+npm i -g @tursodatabase/cli        # one-time, on your machine
+turso db create boighor-bd
+turso db show boighor-bd --url     # → libsql://….turso.io   (TURSO_URL)
+turso db tokens create boighor-bd  # → eyJhbGci…              (TURSO_AUTH_TOKEN)
+```
 
-Everything else — database, auth, image optimisation pipeline, charts — is already
-inside this repository. No external service is required, ever.
+**2 · Vercel (Hobby = free, no card)**
+1. Push this repo to GitHub (done) → vercel.com → *Add New… → Project* → import it.
+2. Framework: **Other**. Root directory: default. No build command needed.
+3. Environment variables: `TURSO_URL`, `TURSO_AUTH_TOKEN` (values from step 1).
+4. Deploy. First request creates the schema and seeds the demo catalogue
+   automatically (`ensureSeeded()`), so `/`, `/admin` work immediately.
+
+**3 · Seed / reseed the remote database from anywhere**
+```bash
+TURSO_URL=libsql://….turso.io TURSO_AUTH_TOKEN=eyJ… npm run seed -- --force
+```
+
+Notes: Vercel functions are ephemeral, so the SQLite *file* mode is disabled
+there by design; all state lives in Turso. You can export your Turso data back
+to a local `.db` at any time (`turso db dump`) — no lock-in. Local development
+and the test-suite still run on embedded SQLite with zero configuration.
+
+### Other free hosts (process-based, keeps embedded SQLite)
+Any host that runs a persistent Node process works unchanged: a VPS behind
+nginx/Caddy, or free-tier process hosts that don't require a card in your
+region. `npm start` is the whole deployment; env vars: `PORT`, `HOST`,
+`DATA_DIR` (see `.env.example`).
 
 ## Licence
 

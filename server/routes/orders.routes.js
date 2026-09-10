@@ -2,11 +2,12 @@
  * Boighor BD — Order API · the WhatsApp conversion engine
  *
  * POST /api/orders  → validates against DB prices (never client prices),
- *                     reserves stock atomically, persists the order, then
- *                     returns the structured WhatsApp message + wa.me link.
+ *                     reserves stock atomically (single transaction on both
+ *                     SQLite and Turso), persists the order, then returns the
+ *                     structured WhatsApp message + wa.me link.
  */
 import { Router } from '../core/router.js';
-import { all, get, run, tx, getSettings } from '../core/db.js';
+import { all, get, run, txBatch, getSettings } from '../core/db.js';
 import { readJson, HttpError } from '../core/http.js';
 import { requireName, requireBdPhone, requireAddress, asInt, oneOf } from '../core/validate.js';
 import { computeTotals, buildWhatsAppMessage, buildWhatsAppUrl, formatTaka } from '../lib/money.js';
@@ -14,13 +15,13 @@ import { currentUser, requireUser, throttle } from '../core/auth.js';
 
 const router = new Router();
 
-function nextOrderCode() {
+async function nextOrderCode() {
   const d = new Date();
   const yy = String(d.getUTCFullYear()).slice(2);
   const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
   const dd = String(d.getUTCDate()).padStart(2, '0');
-  const row = get(`SELECT COUNT(*) AS c FROM orders WHERE code LIKE ?`, `BD-${yy}${mm}${dd}-%`);
-  return `BD-${yy}${mm}${dd}-${String(row.c + 1).padStart(4, '0')}`;
+  const row = await get(`SELECT COUNT(*) AS c FROM orders WHERE code LIKE ?`, `BD-${yy}${mm}${dd}-%`);
+  return `BD-${yy}${mm}${dd}-${String((row?.c || 0) + 1).padStart(4, '0')}`;
 }
 
 const serializeOrder = (o, items) => ({
@@ -49,7 +50,7 @@ const itemsOf = (orderId) =>
 router.post('/api/orders', async (req, res) => {
   throttle(`order:${req.ip}`, 20, 10 * 60 * 1000);
   const body = await readJson(req);
-  const user = currentUser(req);
+  const user = await currentUser(req);
 
   const customer_name = requireName(body.name);
   const customer_phone = requireBdPhone(body.phone);
@@ -63,48 +64,83 @@ router.post('/api/orders', async (req, res) => {
 
   const settings = getSettings();
 
-  const order = tx(() => {
-    const resolved = [];
-    for (const line of lines) {
-      const productId = asInt(line.product_id, 0);
-      const qty = Math.min(20, Math.max(1, asInt(line.qty, 0)));
-      const product = get(
-        `SELECT id, name, price, stock, status, sizes, colors FROM products WHERE id = ?`,
-        productId
-      );
-      if (!product || product.status !== 'active') throw new HttpError(409, 'An item in your cart is no longer available');
-      if (product.stock < qty) {
-        throw new HttpError(409, `Only ${product.stock} left of "${product.name}" — please adjust quantity`, { field: 'stock', product: product.name, stock: product.stock });
-      }
-      const sizes = JSON.parse(product.sizes || '[]');
-      const colors = JSON.parse(product.colors || '[]');
-      const size = sizes.length ? String(line.size || sizes[0]) : '';
-      const color = colors.length ? String(line.color || colors[0].name) : '';
-      const variant = [size, color].filter(Boolean).join(' / ');
-
-      run("UPDATE products SET stock = stock - ?, sold = sold + ?, updated_at = datetime('now') WHERE id = ? AND stock >= ?", qty, qty, productId, qty);
-      resolved.push({ product, qty, variant, unitPrice: product.price });
-    }
-
-    const totals = computeTotals(resolved.map((r) => ({ unitPrice: r.unitPrice, qty: r.qty })), zone, settings);
-    const code = nextOrderCode();
-    const result = run(
-      `INSERT INTO orders(code,user_id,customer_name,customer_phone,customer_address,zone,subtotal,delivery_fee,discount,total,status,note,channel)
-       VALUES(?,?,?,?,?,?,?,?,?,?, 'pending', ?, 'whatsapp')`,
-      code, user ? user.id : null, customer_name, customer_phone, customer_address, zone,
-      totals.subtotal, totals.delivery_fee, totals.discount, totals.total, note
+  /* 1 — read phase: validate everything before writing anything */
+  const resolved = [];
+  for (const line of lines) {
+    const productId = asInt(line.product_id, 0);
+    const qty = Math.min(20, Math.max(1, asInt(line.qty, 0)));
+    const product = await get(
+      `SELECT id, name, price, stock, status, sizes, colors FROM products WHERE id = ?`,
+      productId
     );
-    const orderId = Number(result.lastInsertRowid);
-    for (const r of resolved) {
-      run(
-        'INSERT INTO order_items(order_id,product_id,product_name,variant,qty,unit_price) VALUES(?,?,?,?,?,?)',
-        orderId, r.product.id, r.product.name, r.variant, r.qty, r.unitPrice
-      );
+    if (!product || product.status !== 'active') throw new HttpError(409, 'An item in your cart is no longer available');
+    if (product.stock < qty) {
+      throw new HttpError(409, `Only ${product.stock} left of "${product.name}" — please adjust quantity`, { field: 'stock', product: product.name, stock: product.stock });
     }
-    return get('SELECT * FROM orders WHERE id=?', orderId);
-  });
+    const sizes = JSON.parse(product.sizes || '[]');
+    const colors = JSON.parse(product.colors || '[]');
+    const size = sizes.length ? String(line.size || sizes[0]) : '';
+    const color = colors.length ? String(line.color || colors[0].name) : '';
+    const variant = [size, color].filter(Boolean).join(' / ');
+    resolved.push({ product, qty, variant, unitPrice: product.price });
+  }
 
-  const items = itemsOf(order.id);
+  const totals = computeTotals(resolved.map((r) => ({ unitPrice: r.unitPrice, qty: r.qty })), zone, settings);
+  const code = await nextOrderCode();
+
+  /* 2 — write phase, step A: ONE atomic transaction reserves stock and
+         creates the order header. (last_insert_rowid() can't be reused for
+         several item rows — it advances on every INSERT — so items go in
+         as a single multi-row statement in step B, with compensation if
+         that ever fails.) */
+  const stockStmts = resolved.map((r) => ({
+    sql: 'UPDATE products SET stock = stock - ?, sold = sold + ?, updated_at = datetime(\'now\') WHERE id = ? AND stock >= ?',
+    params: [r.qty, r.qty, r.product.id, r.qty]
+  }));
+  const phase1 = await txBatch([
+    ...stockStmts,
+    {
+      sql: `INSERT INTO orders(code,user_id,customer_name,customer_phone,customer_address,zone,subtotal,delivery_fee,discount,total,status,note,channel)
+            VALUES(?,?,?,?,?,?,?,?,?,?, 'pending', ?, 'whatsapp')`,
+      params: [code, user ? user.id : null, customer_name, customer_phone, customer_address, zone,
+        totals.subtotal, totals.delivery_fee, totals.discount, totals.total, note]
+    }
+  ]);
+  const orderId = phase1[stockStmts.length].lastInsertRowid;
+
+  /* concurrent-oversell guard: every stock UPDATE must have hit exactly 1 row */
+  const short = phase1.slice(0, stockStmts.length).findIndex((r) => r.changes !== 1);
+  if (short >= 0) {
+    await txBatch([
+      { sql: 'DELETE FROM orders WHERE id = ?', params: [orderId] },
+      ...stockStmts.map((s, i) => ({
+        sql: 'UPDATE products SET stock = stock + ?, sold = MAX(0, sold - ?) WHERE id = ?',
+        params: [resolved[i].qty, resolved[i].qty, resolved[i].product.id]
+      }))
+    ]);
+    throw new HttpError(409, `Only limited stock left of "${resolved[short].product.name}" — please adjust quantity`, { field: 'stock', product: resolved[short].product.name });
+  }
+
+  /* 2 — write phase, step B: line items in ONE atomic multi-row INSERT */
+  try {
+    await run(
+      `INSERT INTO order_items(order_id,product_id,product_name,variant,qty,unit_price) VALUES ${resolved.map(() => '(?,?,?,?,?,?)').join(',')}`,
+      ...resolved.flatMap((r) => [orderId, r.product.id, r.product.name, r.variant, r.qty, r.unitPrice])
+    );
+  } catch (err) {
+    await txBatch([
+      { sql: 'DELETE FROM order_items WHERE order_id = ?', params: [orderId] },
+      { sql: 'DELETE FROM orders WHERE id = ?', params: [orderId] },
+      ...resolved.map((r) => ({
+        sql: 'UPDATE products SET stock = stock + ?, sold = MAX(0, sold - ?) WHERE id = ?',
+        params: [r.qty, r.qty, r.product.id]
+      }))
+    ]);
+    throw err;
+  }
+
+  const order = await get('SELECT * FROM orders WHERE id=?', orderId);
+  const items = await itemsOf(order.id);
   const message = buildWhatsAppMessage(order, items, settings);
   const wa_url = buildWhatsAppUrl(message, settings);
 
@@ -117,10 +153,10 @@ router.post('/api/orders', async (req, res) => {
 });
 
 /** Signed-in customer's order history */
-router.get('/api/orders', (req, res) => {
-  const user = requireUser(req);
-  const rows = all('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 50', user.id);
-  res.json(200, rows.map((o) => serializeOrder(o, itemsOf(o.id))));
+router.get('/api/orders', async (req, res) => {
+  const user = await requireUser(req);
+  const rows = await all('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 50', user.id);
+  res.json(200, await Promise.all(rows.map(async (o) => serializeOrder(o, await itemsOf(o.id)))));
 });
 
 /** Guest lookup: order code + phone used at checkout */
@@ -129,9 +165,9 @@ router.post('/api/orders/lookup', async (req, res) => {
   const body = await readJson(req);
   const code = String(body.code || '').trim().toUpperCase();
   const phone = requireBdPhone(body.phone);
-  const order = get('SELECT * FROM orders WHERE code = ? AND customer_phone = ?', code, phone);
+  const order = await get('SELECT * FROM orders WHERE code = ? AND customer_phone = ?', code, phone);
   if (!order) throw new HttpError(404, 'No order found with that code and mobile number');
-  res.json(200, serializeOrder(order, itemsOf(order.id)));
+  res.json(200, serializeOrder(order, await itemsOf(order.id)));
 });
 
 export { serializeOrder, itemsOf, formatTaka };
