@@ -22,8 +22,10 @@ npm test           # 12 end-to-end regression tests (boots a real server)
 npm run seed -- --force   # wipe & re-seed demo data
 ```
 
-Requires **Node ≥ 22.5** (for the built-in `node:sqlite`). No `npm install` needed —
-there are no dependencies.
+Requires **Node 22.5+** (for the built-in `node:sqlite`). No `npm install` needed —
+there are no dependencies. For Vercel, `package.json` pins the project to the
+**Node 22 major line** via `engines.node`, which is the supported way to choose the
+runtime for standard Node.js functions.
 
 | Surface            | URL                            | Credentials                        |
 | ------------------ | ------------------------------ | ---------------------------------- |
@@ -158,7 +160,9 @@ The app is **dual-driver**: embedded SQLite for local/VPS/preview, and **Turso
 (libsql) over HTTP** automatically when `TURSO_URL` + `TURSO_AUTH_TOKEN` are set.
 `vercel.json` is already configured: static assets (CSS/JS/WebP) are served by
 Vercel's CDN from `public/`, and every dynamic route (SSR pages + API + admin)
-runs in one Node 22 serverless function (`api/index.js`).
+runs in one standard Node.js serverless function (`api/index.js`). The Node version
+is selected from `package.json#engines` (pinned to the Node 22 line) because Vercel
+rejects custom Node runtime strings inside `vercel.json` for regular Node functions.
 
 **1 · Turso (free tier, sign up with GitHub — no card)**
 ```bash
